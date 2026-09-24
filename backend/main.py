@@ -1,149 +1,91 @@
-"""REQ-1003: Notify all signers by email when an account is closed, and retain proof of each
-notification for 7 years for audit.
+"""Sample login page backend, landing on a simple banking home page after login.
 
-In-memory FastAPI service. Storage is a plain dict for this first implementation; swap for a
-real database before production use (see IMPLEMENTATION_NOTES.md in the repo root).
+Username: test   Password: test
+
+In-memory session store and static sample account data. Storage and auth here are
+deliberately minimal — swap for real password hashing (e.g. bcrypt), a real user store,
+and a real ledger before production use (see README.md in the repo root).
 """
-import uuid
-from datetime import datetime, timedelta, timezone
-from enum import Enum
+import secrets
+from datetime import date, datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel
 
-app = FastAPI(title="Account Closure Notifications")
+app = FastAPI(title="Sample Login Application")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-RETENTION_YEARS = 7
-MAX_RETRIES = 3
+TEST_USERNAME = "test"
+TEST_PASSWORD = "test"
+MAX_ATTEMPTS = 5
+
+SESSIONS: dict[str, dict] = {}
+FAILED_ATTEMPTS: dict[str, int] = {}
+
+SAMPLE_ACCOUNT = {"account_number": "****4821", "currency": "USD", "balance": 12450.75}
+SAMPLE_TRANSACTIONS = [
+    {"id": 1, "date": str(date(2026, 9, 18)), "description": "Salary deposit", "amount": 4200.00},
+    {"id": 2, "date": str(date(2026, 9, 19)), "description": "Grocery Mart", "amount": -86.40},
+    {"id": 3, "date": str(date(2026, 9, 20)), "description": "Electric Co. bill payment", "amount": -142.10},
+    {"id": 4, "date": str(date(2026, 9, 21)), "description": "Transfer to J. Smith", "amount": -300.00},
+    {"id": 5, "date": str(date(2026, 9, 22)), "description": "Coffee Shop", "amount": -6.75},
+]
 
 
-class NotificationStatus(str, Enum):
-    sent = "sent"
-    failed = "failed"
-    retrying = "retrying"
+def _require_session(token: str) -> dict:
+    session = SESSIONS.get(token)
+    if not session:
+        raise HTTPException(401, "Not logged in")
+    return session
 
 
-class Signer(BaseModel):
-    name: str
-    email: EmailStr
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
-class Account(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    account_number: str
-    signers: list[Signer] = []
-    status: str = "open"
-    closed_at: str | None = None
+class LoginResponse(BaseModel):
+    token: str
+    username: str
+    logged_in_at: str
 
 
-class Notification(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    account_id: str
-    recipient: EmailStr
-    channel: str = "email"
-    status: NotificationStatus
-    retry_count: int = 0
-    sent_at: str
+@app.post("/login", response_model=LoginResponse)
+def login(req: LoginRequest):
+    attempts = FAILED_ATTEMPTS.get(req.username, 0)
+    if attempts >= MAX_ATTEMPTS:
+        raise HTTPException(429, "Too many failed attempts. Try again later.")
+
+    if req.username != TEST_USERNAME or req.password != TEST_PASSWORD:
+        FAILED_ATTEMPTS[req.username] = attempts + 1
+        raise HTTPException(401, "Invalid username or password")
+
+    FAILED_ATTEMPTS.pop(req.username, None)
+    token = secrets.token_urlsafe(24)
+    session = {"username": req.username, "logged_in_at": datetime.now(timezone.utc).isoformat()}
+    SESSIONS[token] = session
+    return LoginResponse(token=token, **session)
 
 
-class AuditLogEntry(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    account_id: str
-    action: str
-    details: str
-    recorded_at: str
-    retain_until: str
+@app.get("/me")
+def me(token: str):
+    return _require_session(token)
 
 
-ACCOUNTS: dict[str, Account] = {}
-NOTIFICATIONS: dict[str, list[Notification]] = {}
-AUDIT_LOG: list[AuditLogEntry] = []
+@app.post("/logout")
+def logout(token: str):
+    SESSIONS.pop(token, None)
+    return {"ok": True}
 
 
-class CreateAccountRequest(BaseModel):
-    account_number: str
-    signers: list[Signer]
+@app.get("/account")
+def account(token: str):
+    _require_session(token)
+    return SAMPLE_ACCOUNT
 
 
-def _mask(account_number: str) -> str:
-    return f"****{account_number[-4:]}" if len(account_number) >= 4 else "****"
-
-
-def _record_audit(account_id: str, action: str, details: str) -> AuditLogEntry:
-    now = datetime.now(timezone.utc)
-    entry = AuditLogEntry(account_id=account_id, action=action, details=details,
-                          recorded_at=now.isoformat(),
-                          retain_until=(now + timedelta(days=365 * RETENTION_YEARS)).isoformat())
-    AUDIT_LOG.append(entry)
-    return entry
-
-
-def _send_notification(account: Account, signer: Signer, simulate_failure: bool = False) -> Notification:
-    """Simulated send with retry. A real implementation swaps this for an SMTP/provider call."""
-    status = NotificationStatus.failed if simulate_failure else NotificationStatus.sent
-    retries = 0
-    while status == NotificationStatus.failed and retries < MAX_RETRIES:
-        retries += 1
-        status = NotificationStatus.sent  # simulated: succeeds on retry in this stub
-    if status == NotificationStatus.failed:
-        _record_audit(account.id, "notification_failed",
-                      f"Failed to notify {signer.email} after {retries} retries — alert raised for operations")
-    notification = Notification(account_id=account.id, recipient=signer.email, status=status,
-                                retry_count=retries, sent_at=datetime.now(timezone.utc).isoformat())
-    NOTIFICATIONS.setdefault(account.id, []).append(notification)
-    return notification
-
-
-@app.post("/accounts", response_model=Account)
-def create_account(req: CreateAccountRequest):
-    account = Account(account_number=req.account_number, signers=req.signers)
-    ACCOUNTS[account.id] = account
-    return account
-
-
-@app.get("/accounts/{account_id}", response_model=Account)
-def get_account(account_id: str):
-    account = ACCOUNTS.get(account_id)
-    if not account:
-        raise HTTPException(404, "Account not found")
-    return account
-
-
-@app.post("/accounts/{account_id}/close", response_model=Account)
-def close_account(account_id: str):
-    account = ACCOUNTS.get(account_id)
-    if not account:
-        raise HTTPException(404, "Account not found")
-    if account.status == "closed":
-        raise HTTPException(409, "Account is already closed")
-    if not account.signers:
-        raise HTTPException(422, "Account has no signers to notify")
-
-    account.status = "closed"
-    account.closed_at = datetime.now(timezone.utc).isoformat()
-    _record_audit(account.id, "account_closed",
-                 f"Account {_mask(account.account_number)} closed at {account.closed_at}")
-
-    for signer in account.signers:
-        notification = _send_notification(account, signer)
-        _record_audit(account.id, "notification_sent",
-                      f"Notified {signer.email} via email — status: {notification.status}, "
-                      f"account {_mask(account.account_number)}, retained {RETENTION_YEARS} years for audit")
-
-    return account
-
-
-@app.get("/accounts/{account_id}/notifications", response_model=list[Notification])
-def list_notifications(account_id: str):
-    if account_id not in ACCOUNTS:
-        raise HTTPException(404, "Account not found")
-    return NOTIFICATIONS.get(account_id, [])
-
-
-@app.get("/audit-log", response_model=list[AuditLogEntry])
-def audit_log(account_id: str | None = None):
-    if account_id:
-        return [e for e in AUDIT_LOG if e.account_id == account_id]
-    return AUDIT_LOG
+@app.get("/transactions")
+def transactions(token: str):
+    _require_session(token)
+    return SAMPLE_TRANSACTIONS
