@@ -1,62 +1,76 @@
 from fastapi.testclient import TestClient
 
-from main import app
+from main import FAILED_ATTEMPTS, SESSIONS, app
 
 client = TestClient(app)
 
 
-def _create_account(signers=None):
-    if signers is None:
-        signers = [{"name": "Alice Signer", "email": "alice@example.com"},
-                  {"name": "Bob Signer", "email": "bob@example.com"}]
-    r = client.post("/accounts", json={"account_number": "1234567890", "signers": signers})
+def setup_function():
+    SESSIONS.clear()
+    FAILED_ATTEMPTS.clear()
+
+
+def test_login_with_correct_credentials():
+    r = client.post("/login", json={"username": "test", "password": "test"})
     assert r.status_code == 200
-    return r.json()
+    data = r.json()
+    assert data["username"] == "test"
+    assert data["token"]
 
 
-def test_create_account():
-    account = _create_account()
-    assert account["status"] == "open"
-    assert len(account["signers"]) == 2
+def test_login_with_wrong_password_rejected():
+    r = client.post("/login", json={"username": "test", "password": "wrong"})
+    assert r.status_code == 401
 
 
-def test_closing_account_notifies_all_signers():
-    account = _create_account()
-    r = client.post(f"/accounts/{account['id']}/close")
+def test_login_with_wrong_username_rejected():
+    r = client.post("/login", json={"username": "nope", "password": "test"})
+    assert r.status_code == 401
+
+
+def test_me_returns_session_for_valid_token():
+    token = client.post("/login", json={"username": "test", "password": "test"}).json()["token"]
+    r = client.get("/me", params={"token": token})
     assert r.status_code == 200
-    assert r.json()["status"] == "closed"
-
-    notifications = client.get(f"/accounts/{account['id']}/notifications").json()
-    assert len(notifications) == 2
-    assert {n["recipient"] for n in notifications} == {"alice@example.com", "bob@example.com"}
-    assert all(n["status"] == "sent" for n in notifications)
+    assert r.json()["username"] == "test"
 
 
-def test_closing_account_writes_audit_trail_with_masked_account_number():
-    account = _create_account()
-    client.post(f"/accounts/{account['id']}/close")
-
-    entries = client.get("/audit-log", params={"account_id": account["id"]}).json()
-    assert any(e["action"] == "account_closed" for e in entries)
-    assert sum(1 for e in entries if e["action"] == "notification_sent") == 2
-    for e in entries:
-        assert "1234567890" not in e["details"]  # full account number must never appear
-        assert "****7890" in e["details"] or e["action"] != "account_closed"
+def test_me_rejects_unknown_token():
+    r = client.get("/me", params={"token": "not-a-real-token"})
+    assert r.status_code == 401
 
 
-def test_cannot_close_account_twice():
-    account = _create_account()
-    client.post(f"/accounts/{account['id']}/close")
-    r = client.post(f"/accounts/{account['id']}/close")
-    assert r.status_code == 409
+def test_logout_invalidates_session():
+    token = client.post("/login", json={"username": "test", "password": "test"}).json()["token"]
+    assert client.post("/logout", params={"token": token}).json()["ok"] is True
+    assert client.get("/me", params={"token": token}).status_code == 401
 
 
-def test_cannot_close_account_with_no_signers():
-    account = _create_account(signers=[])
-    r = client.post(f"/accounts/{account['id']}/close")
-    assert r.status_code == 422
+def test_too_many_failed_attempts_locks_out():
+    for _ in range(5):
+        client.post("/login", json={"username": "lockout-user", "password": "wrong"})
+    r = client.post("/login", json={"username": "lockout-user", "password": "wrong"})
+    assert r.status_code == 429
 
 
-def test_unknown_account_returns_404():
-    assert client.get("/accounts/does-not-exist").status_code == 404
-    assert client.post("/accounts/does-not-exist/close").status_code == 404
+def test_account_requires_login():
+    assert client.get("/account", params={"token": "nope"}).status_code == 401
+
+
+def test_account_returns_balance_when_logged_in():
+    token = client.post("/login", json={"username": "test", "password": "test"}).json()["token"]
+    r = client.get("/account", params={"token": token})
+    assert r.status_code == 200
+    assert r.json()["balance"] > 0
+
+
+def test_transactions_requires_login():
+    assert client.get("/transactions", params={"token": "nope"}).status_code == 401
+
+
+def test_transactions_returns_list_when_logged_in():
+    token = client.post("/login", json={"username": "test", "password": "test"}).json()["token"]
+    r = client.get("/transactions", params={"token": token})
+    assert r.status_code == 200
+    assert len(r.json()) > 0
+    assert "description" in r.json()[0]
